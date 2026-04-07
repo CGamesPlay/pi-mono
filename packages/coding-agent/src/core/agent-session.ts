@@ -45,6 +45,7 @@ import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
 import {
 	type ContextUsage,
+	type ExtensionCommandContext,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
 	ExtensionRunner,
@@ -268,6 +269,24 @@ export class AgentSession {
 	private _retryAttempt = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
+
+	// Scheduled internal continuation. Set when retry/auto-compaction has
+	// queued an `agent.continue()` onto _agentEventQueue. Cleared when that
+	// chained work runs (or its rejection handler runs). Used to:
+	//   - dedupe overlapping schedule attempts
+	//   - keep _isTrulyIdle() honest while a continuation is pending
+	private _continueScheduled = false;
+
+	// Pending callbacks registered via runWhenIdle(). Drained one at a time
+	// once the session reaches a true-idle state (no streaming, no
+	// compaction, no retry, no queued messages, no pending continuation).
+	// Cleared on reload() so closures bound to the prior extension runtime
+	// don't fire against the new one.
+	private _idleCallbacks: Array<(ctx: ExtensionCommandContext) => Promise<void> | void> = [];
+	// True while _drainIdleCallbacks is actively running a callback.
+	// Prevents the post-event drain from re-entering itself if a callback
+	// transitively triggers another drain attempt.
+	private _idleDraining = false;
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -572,11 +591,139 @@ export class AgentSession {
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			if (this._isRetryableError(msg)) {
 				const didRetry = await this._handleRetryableError(msg);
-				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+				if (didRetry) return; // Retry was initiated; the scheduled
+				// continuation already chains a drain attempt in its
+				// settle path.
 			}
 
 			this._resolveRetry();
 			await this._checkCompaction(msg);
+		}
+
+		// Try to drain runWhenIdle callbacks at the natural settling
+		// moment — when the agent finishes a turn and nothing else is
+		// already queued. _scheduleContinue's settle path covers the
+		// retry / auto-compaction paths separately, so we only schedule
+		// here when neither of those took over.
+		if (event.type === "agent_end" && !this._continueScheduled) {
+			this._scheduleIdleDrain();
+		}
+	}
+
+	/**
+	 * Schedule `agent.continue()` to run after the current event-queue work
+	 * settles. Used by retry and auto-compaction to resume a turn without
+	 * reentering the agent inside its own emit, deadlocking against the
+	 * parked _processAgentEvent that triggered them, or driving an agent
+	 * that was swapped out underneath us in the meantime.
+	 *
+	 * Chains the continuation onto _agentEventQueue, so it serializes
+	 * naturally with any further events that arrive before it fires. The
+	 * captured `targetAgent` reference is checked at fire time so that
+	 * fork() / newSession() / switchSession() between schedule and fire
+	 * silently drops the stale continuation rather than driving the new
+	 * session.
+	 */
+	private _scheduleContinue(): void {
+		if (this._continueScheduled) return;
+		this._continueScheduled = true;
+		const targetAgent = this.agent;
+		this._agentEventQueue = this._agentEventQueue.then(
+			async () => {
+				this._continueScheduled = false;
+				if (this.agent !== targetAgent) return;
+				if (targetAgent.state.isStreaming) return;
+				try {
+					await targetAgent.continue();
+				} catch {
+					// Mirror the prior `.catch(() => {})` swallow. Failures
+					// surface via the next agent_end event.
+				}
+				this._scheduleIdleDrain();
+			},
+			() => {
+				this._continueScheduled = false;
+				this._scheduleIdleDrain();
+			},
+		);
+		this._agentEventQueue.catch(() => {});
+	}
+
+	/**
+	 * True when the session has nothing in flight and no internally
+	 * scheduled work pending: not streaming, not compacting, not retrying,
+	 * no queued steering/follow-up/next-turn messages, and no
+	 * _scheduleContinue() pending. This is the gate `runWhenIdle`
+	 * callbacks wait on.
+	 */
+	private _isTrulyIdle(): boolean {
+		return (
+			!this.agent.state.isStreaming &&
+			!this.isCompacting &&
+			this._retryPromise === undefined &&
+			!this.agent.hasQueuedMessages() &&
+			this._steeringMessages.length === 0 &&
+			this._followUpMessages.length === 0 &&
+			this._pendingNextTurnMessages.length === 0 &&
+			!this._continueScheduled
+		);
+	}
+
+	/**
+	 * Register a callback to run when the session reaches a true-idle
+	 * state. Callbacks run one at a time, in registration order; idle is
+	 * re-checked between callbacks because a callback may itself trigger
+	 * new work.
+	 */
+	runWhenIdle(callback: (ctx: ExtensionCommandContext) => Promise<void> | void): void {
+		this._idleCallbacks.push(callback);
+		this._scheduleIdleDrain();
+	}
+
+	/**
+	 * Chain a drain attempt onto the event queue. Called at the tail of
+	 * _processAgentEvent, from _scheduleContinue's settle path, and on
+	 * runWhenIdle registration. Multiple chained attempts are harmless —
+	 * _drainIdleCallbacks is a no-op when not idle or when already running.
+	 */
+	private _scheduleIdleDrain(): void {
+		this._agentEventQueue = this._agentEventQueue.then(
+			() => this._drainIdleCallbacks(),
+			() => this._drainIdleCallbacks(),
+		);
+		this._agentEventQueue.catch(() => {});
+	}
+
+	/**
+	 * Drain idle callbacks one at a time. Stops if the session is not
+	 * idle or no callbacks remain. Errors thrown by callbacks are routed
+	 * to the existing extension-error plumbing so one bad plugin can't
+	 * starve the rest of the queue.
+	 */
+	private async _drainIdleCallbacks(): Promise<void> {
+		if (this._idleDraining) return;
+		if (this._idleCallbacks.length === 0) return;
+		if (!this._isTrulyIdle()) return;
+
+		this._idleDraining = true;
+		try {
+			while (this._idleCallbacks.length > 0 && this._isTrulyIdle()) {
+				const callback = this._idleCallbacks.shift();
+				if (!callback) break;
+				const ctx = this._extensionRunner.createCommandContext();
+				try {
+					await callback(ctx);
+				} catch (err) {
+					this._extensionRunner.emitError({
+						extensionPath: "<runWhenIdle>",
+						event: "runWhenIdle",
+						error: err instanceof Error ? err.message : String(err),
+						stack: err instanceof Error ? err.stack : undefined,
+					});
+				}
+			}
+		} finally {
+			this._idleDraining = false;
 		}
 	}
 
@@ -1080,6 +1227,11 @@ export class AgentSession {
 			return;
 		}
 
+		// Flush pending model/thinking-level settings to session before turn starts
+		if (this.model) {
+			this.sessionManager.flushPendingSettings(this.model.provider, this.model.id, this.thinkingLevel);
+		}
+
 		preflightResult?.(true);
 		await this.agent.prompt(messages);
 		await this.waitForRetry();
@@ -1396,7 +1548,6 @@ export class AgentSession {
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
 		// Re-clamp thinking level for new model's capabilities
@@ -1433,7 +1584,6 @@ export class AgentSession {
 
 		// Apply model
 		this.agent.state.model = next.model;
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		// Apply thinking level.
@@ -1461,7 +1611,6 @@ export class AgentSession {
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = nextModel;
-		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		// Re-clamp thinking level for new model's capabilities
@@ -1491,7 +1640,6 @@ export class AgentSession {
 		this.agent.state.thinkingLevel = effectiveLevel;
 
 		if (isChanging) {
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
 			if (this.supportsThinking() || effectiveLevel !== "off") {
 				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 			}
@@ -1981,15 +2129,11 @@ export class AgentSession {
 					this.agent.state.messages = messages.slice(0, -1);
 				}
 
-				setTimeout(() => {
-					this.agent.continue().catch(() => {});
-				}, 100);
+				this._scheduleContinue();
 			} else if (this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.
-				setTimeout(() => {
-					this.agent.continue().catch(() => {});
-				}, 100);
+				this._scheduleContinue();
 			}
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
@@ -2187,6 +2331,7 @@ export class AgentSession {
 				},
 				getThinkingLevel: () => this.thinkingLevel,
 				setThinkingLevel: (level) => this.setThinkingLevel(level),
+				runWhenIdle: (callback) => this.runWhenIdle(callback),
 			},
 			{
 				getModel: () => this.model,
@@ -2370,6 +2515,10 @@ export class AgentSession {
 	}
 
 	async reload(): Promise<void> {
+		// Drop pending idle callbacks before tearing down the runner.
+		// They were registered against the old extension graph and should
+		// not run against the rebuilt one.
+		this._idleCallbacks = [];
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
@@ -2484,12 +2633,11 @@ export class AgentSession {
 		}
 		this._retryAbortController = undefined;
 
-		// Retry via continue() - use setTimeout to break out of event handler chain
-		setTimeout(() => {
-			this.agent.continue().catch(() => {
-				// Retry failed - will be caught by next agent_end
-			});
-		}, 0);
+		// Retry via continue() — chain onto _agentEventQueue so we don't
+		// reenter the agent inside its own emit, don't deadlock against
+		// the _processAgentEvent that's awaiting us, and drop cleanly if
+		// the session was swapped during the backoff sleep.
+		this._scheduleContinue();
 
 		return true;
 	}

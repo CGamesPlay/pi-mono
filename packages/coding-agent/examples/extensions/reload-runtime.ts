@@ -2,7 +2,8 @@
  * Reload Runtime Extension
  *
  * Demonstrates ctx.reload() from ExtensionCommandContext and an LLM-callable
- * tool that queues a follow-up command to trigger reload.
+ * tool that uses pi.runWhenIdle() to schedule a reload after the current
+ * turn completes.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -19,17 +20,22 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// LLM-callable tool. Tools get ExtensionContext, so they cannot call ctx.reload() directly.
-	// Instead, queue a follow-up user command that executes the command above.
+	// LLM-callable tool. Tools get ExtensionContext, which doesn't expose
+	// session-mutating actions like reload() — those are only safe once
+	// the session is idle. pi.runWhenIdle() defers a callback until the
+	// session reaches that state and provides an ExtensionCommandContext
+	// to the callback.
 	pi.registerTool({
 		name: "reload_runtime",
 		label: "Reload Runtime",
 		description: "Reload extensions, skills, prompts, and themes",
 		parameters: Type.Object({}),
 		async execute() {
-			pi.sendUserMessage("/reload-runtime", { deliverAs: "followUp" });
+			pi.runWhenIdle(async (ctx) => {
+				await ctx.reload();
+			});
 			return {
-				content: [{ type: "text", text: "Queued /reload-runtime as a follow-up command." }],
+				content: [{ type: "text", text: "Reload scheduled for when the session is idle." }],
 				details: {},
 			};
 		},

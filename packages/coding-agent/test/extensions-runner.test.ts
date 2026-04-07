@@ -66,6 +66,7 @@ describe("ExtensionRunner", () => {
 		setModel: async () => false,
 		getThinkingLevel: () => "off",
 		setThinkingLevel: () => {},
+		runWhenIdle: () => {},
 	};
 
 	const extensionContextActions: ExtensionContextActions = {

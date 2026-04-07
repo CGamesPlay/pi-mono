@@ -36,6 +36,17 @@ describe("AgentSession model and extension characterization", () => {
 
 		expect(harness.session.model?.id).toBe("faux-2");
 		expect(modelEvents).toEqual(["faux-1->faux-2:set"]);
+		// Model change entry is deferred until prompt()
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "model_change")
+				.map((entry) => `${entry.provider}/${entry.modelId}`),
+		).toEqual([]);
+
+		// Flush writes the entry on first prompt
+		harness.setResponses([fauxAssistantMessage("response")]);
+		await harness.session.prompt("test");
 		expect(
 			harness.sessionManager
 				.getEntries()

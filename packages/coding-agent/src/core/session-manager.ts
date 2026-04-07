@@ -870,6 +870,17 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Flush pending model/thinking-level settings to the session (if they differ from session tree). Called once per turn before prompting. */
+	flushPendingSettings(provider: string, modelId: string, thinkingLevel: string): void {
+		const context = this.buildSessionContext();
+		if (!context.model || context.model.provider !== provider || context.model.modelId !== modelId) {
+			this.appendModelChange(provider, modelId);
+		}
+		if (context.thinkingLevel !== thinkingLevel) {
+			this.appendThinkingLevelChange(thinkingLevel);
+		}
+	}
+
 	/** Append a compaction summary as child of current leaf, then advance leaf. Returns entry id. */
 	appendCompaction<T = unknown>(
 		summary: string,
