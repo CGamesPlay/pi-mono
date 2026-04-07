@@ -398,7 +398,7 @@ Key methods for working with sessions programmatically.
 - `getLabel(id)` - Get label for entry
 - `branch(entryId)` - Move leaf to earlier entry
 - `resetLeaf()` - Reset leaf to null (before any entries)
-- `branchWithSummary(entryId, summary, details?, fromHook?)` - Branch with context summary
+- `branchWithSummary(entryId, summary, details?, fromHook?, fromId?)` - Branch with context summary. `fromId` is the previous leaf (tip of the abandoned path).
 
 ### Instance Methods - Context & Info
 - `buildSessionContext()` - Get messages, thinkingLevel, and model for LLM
