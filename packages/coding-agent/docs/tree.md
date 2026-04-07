@@ -152,7 +152,7 @@ Flow:
 - `resetLeaf(): void` - Set leaf to null (for root user message navigation)
 - `getTree(): SessionTreeNode[]` - Full tree with children sorted by timestamp
 - `branch(id)` - Change leaf pointer
-- `branchWithSummary(id, summary)` - Change leaf and create summary entry
+- `branchWithSummary(id, summary, details?, fromHook?, fromId?)` - Change leaf and create summary entry. `fromId` is the previous leaf (tip of the abandoned path).
 
 ### InteractiveMode
 

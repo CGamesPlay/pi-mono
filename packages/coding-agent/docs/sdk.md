@@ -656,7 +656,7 @@ sm.appendLabelChange(id, "checkpoint"); // Set label
 
 // Branching
 sm.branch(entryId);                     // Move leaf to earlier entry
-sm.branchWithSummary(id, "Summary...");  // Branch with context summary
+sm.branchWithSummary(id, "Summary...", undefined, false, oldLeafId);  // Branch with context summary
 sm.createBranchedSession(leafId);       // Extract path to new file
 ```
 
