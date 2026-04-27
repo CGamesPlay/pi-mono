@@ -1142,9 +1142,7 @@ Important behavior:
 
 For predictable behavior, treat reload as terminal for that handler (`await ctx.reload(); return;`).
 
-Tools run with `ExtensionContext`, so they cannot call `ctx.reload()` directly. Use a command as the reload entrypoint, then expose a tool that queues that command as a follow-up user message.
-
-Example tool the LLM can call to trigger reload:
+Tools run with `ExtensionContext`, so they cannot call `ctx.reload()` directly — session-mutating actions are only safe when the session is idle. Use `pi.runWhenIdle()` to defer the reload until the current turn completes:
 
 ```typescript
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -1165,14 +1163,18 @@ export default function (pi: ExtensionAPI) {
     description: "Reload extensions, skills, prompts, and themes",
     parameters: Type.Object({}),
     async execute() {
-      pi.sendUserMessage("/reload-runtime", { deliverAs: "followUp" });
+      pi.runWhenIdle(async (ctx) => {
+        await ctx.reload();
+      });
       return {
-        content: [{ type: "text", text: "Queued /reload-runtime as a follow-up command." }],
+        content: [{ type: "text", text: "Reload scheduled for when the session is idle." }],
       };
     },
   });
 }
 ```
+
+See [pi.runWhenIdle()](#pirunwhenidlecallback) for full semantics.
 
 ## ExtensionAPI Methods
 
@@ -1281,6 +1283,33 @@ pi.sendUserMessage("And then summarize", { deliverAs: "followUp" });
 When not streaming, the message is sent immediately and triggers a new turn. When streaming without `deliverAs`, throws an error.
 
 See [send-user-message.ts](../examples/extensions/send-user-message.ts) for a complete example.
+
+### pi.runWhenIdle(callback)
+
+Defer work until the session is truly idle. Tools and event handlers run with `ExtensionContext`, which doesn't expose session-mutating actions like `newSession`, `fork`, `switchSession`, `navigateTree`, or `reload` — those are only safe when the agent isn't streaming, compacting, retrying, or holding queued messages. `runWhenIdle()` queues a callback and runs it as soon as the session reaches that state.
+
+```typescript
+pi.registerTool({
+  name: "swap_session",
+  parameters: Type.Object({ path: Type.String() }),
+  async execute({ path }) {
+    pi.runWhenIdle(async (ctx) => {
+      await ctx.switchSession(path);
+    });
+    return { content: [{ type: "text", text: "Session swap scheduled." }] };
+  },
+});
+```
+
+**Semantics:**
+
+- The callback receives an `ExtensionCommandContext` — the same surface as a slash-command handler.
+- Callbacks run one at a time, in registration order. Idle is re-checked between each, so a callback that triggers new work (e.g. `sendUserMessage`) re-arms the gate before the next callback runs.
+- If `ctx.reload()` is called from anywhere before a queued callback fires, the queue is dropped — closures bound to the prior extension graph never run against the rebuilt one.
+- Errors thrown by a callback are routed to the extension error listener; subsequent callbacks still run.
+- In modes that don't bind command-context actions (e.g. non-interactive), the session-mutating methods on `ctx` are no-ops, mirroring how `pi.registerCommand` handlers behave there.
+
+See [reload-runtime.ts](../examples/extensions/reload-runtime.ts) for a complete example.
 
 ### pi.appendEntry(customType, data?)
 
@@ -2485,7 +2514,7 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `handoff.ts` | Cross-provider model handoff | `registerCommand`, `ui.editor`, `ui.custom` |
 | `qna.ts` | Q&A with custom UI | `registerCommand`, `ui.custom`, `setEditorText` |
 | `send-user-message.ts` | Inject user messages | `registerCommand`, `sendUserMessage` |
-| `reload-runtime.ts` | Reload command and LLM tool handoff | `registerCommand`, `ctx.reload()`, `sendUserMessage` |
+| `reload-runtime.ts` | Reload command and LLM tool handoff | `registerCommand`, `ctx.reload()`, `runWhenIdle` |
 | `shutdown-command.ts` | Graceful shutdown command | `registerCommand`, `shutdown()` |
 | **Events & Gates** |||
 | `permission-gate.ts` | Block dangerous commands | `on("tool_call")`, `ui.confirm` |
